@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# m2ctl —— M2 调制架构调试入口
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+export HF_HOME="$ROOT/.hf-cache"
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+exec "$ROOT/.venv/bin/python" -m m2.cli "$@"

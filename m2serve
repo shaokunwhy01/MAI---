@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# m2serve —— M2 模型服务管理（launchd 托管，独立于 DSH 进程树）
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+PORT="${M2_PORT:-8765}"
+PIDFILE="$ROOT/m2_state/serve.pid"
+LOG="$ROOT/m2_state/serve.log"
+LABEL="com.m2serve.local"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+mkdir -p "$ROOT/m2_state"
+
+pid_on_port() { lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1; }
+health() { curl -s --max-time 2 "http://127.0.0.1:$PORT/health" 2>/dev/null; }
+is_up() { [ -n "$(health)" ]; }
+agent_loaded() { launchctl list 2>/dev/null | grep -q "$LABEL"; }
+
+wait_up() {
+  for i in $(seq 1 "$1"); do
+    sleep 1
+    if is_up; then echo "就绪  http://127.0.0.1:${PORT}   PID $(pid_on_port)   用时 ${i}s"; return 0; fi
+  done
+  return 1
+}
+
+cmd_install() {
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat >"$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>${ROOT}/m2ctl</string><string>serve</string>
+    <string>--port</string><string>${PORT}</string>
+  </array>
+  <key>WorkingDirectory</key><string>${ROOT}</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${LOG}</string>
+  <key>StandardErrorPath</key><string>${LOG}</string>
+</dict></plist>
+PLIST
+  launchctl unload "$PLIST" >/dev/null 2>&1
+  launchctl load -w "$PLIST"
+  echo "已安装 LaunchAgent: $PLIST"
+  echo "（登录自启、崩溃自拉，与 DSH 无关）"
+  wait_up 60 || { echo "启动超时，看日志 $LOG"; return 1; }
+}
+
+cmd_uninstall() {
+  [ -f "$PLIST" ] && launchctl unload "$PLIST" >/dev/null 2>&1
+  rm -f "$PLIST"
+  echo "已移除 LaunchAgent，服务已停"
+}
+
+cmd_start() {
+  if is_up; then echo "已在运行（端口 ${PORT}，PID $(pid_on_port)）"; return 0; fi
+  if [ -f "$PLIST" ]; then
+    echo "启动中（launchd 托管）…"
+    launchctl load -w "$PLIST" 2>/dev/null
+  else
+    echo "启动中…（约 15 秒；注意：这是 DSH 的子进程，DSH 重启会带走它）"
+    nohup ./m2ctl serve --port "$PORT" >>"$LOG" 2>&1 &
+    echo $! >"$PIDFILE"
+  fi
+  wait_up 60 || { echo "启动失败，最后 20 行："; tail -20 "$LOG"; return 1; }
+  echo "日志  $LOG"
+}
+
+cmd_stop() {
+  if [ -f "$PLIST" ] && agent_loaded; then
+    launchctl unload "$PLIST" 2>/dev/null
+    for i in $(seq 1 10); do sleep 0.5; is_up || break; done
+    is_up && echo "未停止（launchd 仍在拉起）" || echo "已停止（launchd 已卸载）"
+    return 0
+  fi
+  local pid; pid="$(pid_on_port)"
+  [ -z "$pid" ] && { echo "未运行"; rm -f "$PIDFILE"; return 0; }
+  echo "停止 PID $pid …"
+  kill -TERM "$pid" 2>/dev/null
+  for i in $(seq 1 10); do sleep 0.5; is_up || break; done
+  if is_up; then kill -KILL "$pid" 2>/dev/null; sleep 0.5; fi
+  rm -f "$PIDFILE"
+  is_up && { echo "未能停止"; return 1; } || echo "已停止"
+}
+
+cmd_status() {
+  local h; h="$(health)"
+  if [ -z "$h" ]; then
+    echo "未运行（端口 ${PORT}）"
+    [ -f "$PLIST" ] && echo "launchd 已安装但未加载：./m2serve start" 
+    return 1
+  fi
+  echo "$h" | "$ROOT/.venv/bin/python" -c '
+import json, sys
+d = json.load(sys.stdin); b, v = d["base"], d["versions"]; port = sys.argv[1]
+print("运行中   http://127.0.0.1:%s    uptime %.0fs" % (port, d["uptime_s"]))
+print("底座     %s   %d 层 / hidden %d" % (b["model_id"], b["n_layers"], b["hidden_dim"]))
+print("记忆     %d 条事件   %s" % (d["events"], d["m2_version"]))
+print("版本     %s/%s/%s/%s/%s" % (v["base"], v["e"], v["m2"], v["decode"], v["config"]))
+' "$PORT"
+  local pid ppid
+  pid="$(pid_on_port)"
+  ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  if [ -f "$PLIST" ] && agent_loaded; then
+    echo "托管     launchd（登录自启 + 崩溃自拉）"
+  elif [ -z "${ppid:-}" ]; then
+    echo "托管     nohup（ps 不可用，读不到父进程）"
+  elif [ "${ppid}" = "1" ]; then
+    echo "托管     nohup 已脱离（DSH 重启不带走；无崩溃自拉/登录自启）"
+  else
+    echo "托管     nohup 子进程（父 PID ${ppid:-?}，父进程退出即被带走）"
+  fi
+}
+
+case "${1:-}" in
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  start)     cmd_start ;;
+  stop)      cmd_stop ;;
+  restart)   cmd_stop; cmd_start ;;
+  status)    cmd_status ;;
+  log)       tail -n "${2:-40}" "$LOG" ;;
+  *) cat <<EOF
+用法: ./m2serve {install|uninstall|start|stop|restart|status|log [n]}
+
+  install    装成 LaunchAgent（登录自启、崩溃自拉、与 DSH 解耦）★推荐
+  uninstall  移除 LaunchAgent
+  start      启动（装了就用 launchd，没装就 nohup）
+  stop       停止（launchd 模式会先卸载，否则会被立刻拉起）
+  status     状态
+  log [n]    最近 n 行日志
+
+环境变量 M2_PORT 改端口（默认 8765）
+EOF
+     exit 1 ;;
+esac
